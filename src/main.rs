@@ -1,10 +1,12 @@
 use std::os::unix::fs::DirEntryExt;
 //use std::sync::mpsc::{channel, Sender, Receiver};
-use std::sync::{Arc, Mutex, Condvar};
+use std::sync::{Arc, Mutex, Condvar, RwLock};
 use std::thread;
 use std::thread::sleep;
 use crossbeam_channel::{unbounded, Receiver, select, bounded, Sender};
 use std::time::Duration;
+use std::collections::HashMap;
+use rand::Rng;
 
 
 enum ElevatorCommand {
@@ -14,6 +16,10 @@ enum ElevatorCommand {
 }
 
 enum ControlCommand {
+    Request { floor: u8, direction: Direction }
+}
+
+enum FloorCommand {
     Request { floor: u8, direction: Direction }
 }
 
@@ -59,9 +65,9 @@ struct ControlSystem {
 impl ControlSystem {
     fn new(
         elevators: Vec<Sender<ElevatorCommand>>,
+        command_rx: Receiver<ControlCommand>,
         status_rx: Receiver<ElevatorStatus>,
-    ) -> (Self, Sender<ControlCommand>) {
-        let (control_tx, command_rx) = unbounded();
+    ) -> Self {
 
         let control_system = Self {
             elevators,
@@ -78,7 +84,7 @@ impl ControlSystem {
             ControlSystem::run(elevators_clone, command_rx_clone, status_rx_clone);
         });
 
-        (control_system, control_tx)
+        control_system
     }
 
     fn run(
@@ -252,47 +258,62 @@ struct Floor {
 }
 
 impl Floor {
-    fn request_up(&mut self) {
-        self.up_request = true;
-        self.control_tx.send(ControlCommand::Request {
-            floor: self.id,
-            direction: Direction::Up,
-        }).unwrap();
-    }
-
-    fn request_down(&mut self) {
-        self.up_request = true;
-        self.control_tx.send(ControlCommand::Request {
-            floor: self.id,
-            direction: Direction::Down,
-        }).unwrap();
+    fn new(id: u8, control_tx: Sender<ControlCommand>, floor_rx: Receiver<FloorCommand>) {
+        thread::spawn(move || {
+            while let Ok(FloorCommand::Request { floor: _, direction }) = floor_rx.recv() { 
+                control_tx
+                    .send(ControlCommand::Request {
+                        floor: id,
+                        direction, 
+                    })
+                    .unwrap();
+            }
+        });
     }
 }
 
 
 
 fn main() {
+    let floors = 4;
+    let elevators = 3;
+    let passengers = 2;
+
+    let mut floor_channels: HashMap<u8, Sender<FloorCommand>> = HashMap::new();
     let mut elevator_senders = Vec::new();
+    let (control_tx, control_rx) = unbounded();
     let (status_tx, status_rx) = unbounded();
 
     // Fahrstühle initialisieren
-    for id in 0..3 {
+    for id in 0..elevators {
         let (elevator_tx, elevator_rx) = unbounded();
         elevator_senders.push(elevator_tx);
-
         Elevator::new(id, elevator_rx, status_tx.clone());
     }
 
+    // Etagen initialisieren
+    for i in 0..floors {
+        let (floor_tx, floor_rx) = unbounded();
+        floor_channels.insert(i, floor_tx);
+        Floor::new(i, control_tx.clone(), floor_rx);
+    }
+
     // Control System initialisieren
-    let (control_system, control_tx) = ControlSystem::new(elevator_senders, status_rx);
+    let control_system = ControlSystem::new(elevator_senders, control_rx, status_rx);
+
+    // Passagiere initialisieren
+    for i in 0..passengers {
+        
+    }
+    floor_channels.get(&0).unwrap().send(FloorCommand::Request { floor: 0, direction: Direction::Up }).unwrap();
 
     // Beispieleingaben
-    control_tx
-        .send(ControlCommand::Request {
-            floor: 2,
-            direction: Direction::Up,
-        })
-        .unwrap();
+    // control_tx
+    //     .send(ControlCommand::Request {
+    //         floor: 2,
+    //         direction: Direction::Up,
+    //     })
+    //     .unwrap();
 
     // Simulieren von Anfragen
     thread::sleep(Duration::from_secs(10));
