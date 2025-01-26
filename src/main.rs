@@ -54,6 +54,7 @@ enum ElevatorStatus {
     DoorClosed(usize, u8),
     ArrivedAtFloor(usize, u8),
     TaskCompleted(usize), // Aufgabe erledigt, optional mit Zusatzinfo
+    PassengerCount(u8),
 }
 
 enum DoorState {
@@ -136,6 +137,9 @@ impl ControlSystem {
                             }
                             ElevatorStatus::TaskCompleted(id) => {
                                 println!("Elevator {} completed a task", id);
+                            }
+                            ElevatorStatus::PassengerCount(id) => {
+                                println!("{} passengers in elevator", id);
                             }
                         }
                     }
@@ -382,7 +386,9 @@ impl Passenger {
                         })
                         .unwrap();
                 }
+
                 // Warten auf Nachricht vom Fahrstuhl
+                let mut elevator = None;
                 if let Some(receiver) = passenger
                     .elevator_floor_receiver
                     .read()
@@ -394,16 +400,38 @@ impl Passenger {
                             "Passenger {}: Elevator {} arrived at floor {}",
                             passenger.id, elevator_id, passenger.current_floor
                         );
+                        elevator = Some(elevator_id);
+
+                        // Nachricht an den Fahrstuhl senden
+                        passenger
+                            .passenger_elevator_transmitter
+                            .read()
+                            .unwrap()
+                            .get(elevator_id as usize)
+                            .unwrap()
+                            .send(PassengerToElevator::Enter(passenger.id as u8))
+                            .expect("Failed to send PassengerToElevator::Enter message");
+
+                        // Warten auf Antwort vom Fahrstuhl
+                        let response = select! {
+                recv(passenger.elevator_passenger_receiver) -> msg => msg.ok(),
+                default(Duration::from_secs(1)) => None, // Timeout nach 1 Sekunde
+            };
+
+                        if let Some(ElevatorToPassenger::YouEntered()) = response {
+                            println!("Passenger {}: Successfully entered Elevator {}", passenger.id, elevator_id);
+                            break; // Beende die Schleife, wenn der Passagier eingestiegen ist
+                        } else {
+                            println!("Passenger {}: No response from Elevator {} within 1 second", passenger.id, elevator_id);
+                            continue; // Zurück zur Anfrage an die aktuelle Etage
+                        }
                     }
-                } else {
-                    println!(
-                        "Passenger {}: No elevator receiver found for floor {}",
-                        passenger.id, passenger.current_floor
-                    );
                 }
-                // Simuliere das Warten auf den Fahrstuhl
-                thread::sleep(Duration::from_secs(rng.gen_range(2..5)));
+
+                println!("Passenger {}: No elevator available, retrying...", passenger.id);
+                thread::sleep(Duration::from_secs(1));
             }
+
         });
     }
 }
