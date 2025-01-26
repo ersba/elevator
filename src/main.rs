@@ -23,7 +23,7 @@ enum FloorCommand {
     Request { floor: u8, direction: Direction }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum Direction {
     Up,
     Down,
@@ -98,8 +98,9 @@ impl ControlSystem {
                     if let Ok(command) = command {
                         match command {
                             ControlCommand::Request { floor, direction } => {
-                                println!("Request received: Floor {} going {:?}", floor, direction);
+                                println!("Control System: Received request from floor {} going {:?}", floor, direction);
                                 let best_elevator = 0; // Einfache Logik: immer der erste Fahrstuhl
+                                println!("Control System: Assigning Elevator {} to floor {}", best_elevator, floor);
                                 elevators[best_elevator]
                                     .send(ElevatorCommand::MoveTo(floor))
                                     .unwrap();
@@ -137,6 +138,10 @@ struct Elevator {
     state: ElevatorState,
     door: Door,
     status_tx: Sender<ElevatorStatus>, // Sender für Statusupdates
+    passenger_count: usize,
+    elevator_floor_transmitter: Arc<RwLock<Vec<Sender<ElevatorArrived>>>>,
+    elevator_to_passenger_transmitter: Arc<RwLock<Vec<Sender<ElevatorToPassenger>>>>,
+    passenger_to_elevator_receiver: Arc<RwLock<Vec<Receiver<PassengerToElevator>>>>
 }
 
 impl Elevator {
@@ -151,6 +156,10 @@ impl Elevator {
             state: ElevatorState::IdleAtFloor(0),
             door: Door::new(),
             status_tx,
+            passenger_count: 0,
+            elevator_floor_transmitter,
+            elevator_to_passenger_transmitter,
+            passenger_to_elevator_receiver
         }));
 
         let elevator_clone = Arc::clone(&elevator);
@@ -173,18 +182,21 @@ impl Elevator {
                             let mut elevator = elevator.lock().unwrap();
                             match command {
                                 ElevatorCommand::MoveTo(floor) => {
+                                    println!("Elevator {}: Received move request to floor {}", elevator.id, floor);
                                     elevator.move_to(floor);
                                     elevator.status_tx
                                         .send(ElevatorStatus::ArrivedAtFloor(elevator.id, floor))
                                         .unwrap();
                                 }
                                 ElevatorCommand::OpenDoor => {
+                                    println!("Elevator {}: Received open door command", elevator.id);
                                     elevator.open_door();
                                     elevator.status_tx
                                         .send(ElevatorStatus::DoorOpened(elevator.id, elevator.current_floor))
                                         .unwrap();
                                 }
                                 ElevatorCommand::CloseDoor => {
+                                    println!("Elevator {}: Received close door command", elevator.id);
                                     elevator.close_door();
                                     elevator.status_tx
                                         .send(ElevatorStatus::DoorClosed(elevator.id, elevator.current_floor))
@@ -202,10 +214,22 @@ impl Elevator {
     }
 
     fn move_to(&mut self, target_floor: u8) {
-        println!("Elevator {} moving from floor {} to floor {}", self.id, self.current_floor, target_floor);
-        self.state = ElevatorState::Moving(self.current_floor, target_floor);
-        self.current_floor = target_floor;
-        self.state = ElevatorState::IdleAtFloor(target_floor);
+        if (self.current_floor == 0 && target_floor < 0) || (self.current_floor == 3 && target_floor > 3) {
+            println!("Elevator {}: Invalid move requested! Cannot move beyond floor limits.", self.id);
+            return;
+        }
+        if let DoorState::Open = self.door.state {
+            println!("Elevator {}: Cannot move while door is open!", self.id);
+        } else {
+            println!("Elevator {} moving from floor {} to floor {}", self.id, self.current_floor, target_floor);
+            self.state = ElevatorState::Moving(self.current_floor, target_floor);
+            self.current_floor = target_floor;
+            println!("Elevator {}: Arrived at floor {}", self.id, target_floor);
+            self.state = ElevatorState::IdleAtFloor(target_floor);
+            self.elevator_floor_transmitter.read().unwrap().get(self.current_floor as usize)
+                .unwrap().send(ElevatorArrived::Elevator(self.id as u8)).unwrap();
+
+        }
     }
 
     fn open_door(&mut self) {
@@ -213,9 +237,12 @@ impl Elevator {
         self.state = ElevatorState::StoppedAtFloor(self.current_floor);
     }
 
+
     fn close_door(&mut self) {
-        self.door.close();
+            self.door.close();
     }
+
+
 }
 
 struct Door {
@@ -232,8 +259,8 @@ impl Door {
     fn open(&mut self) {
         if let DoorState::Closed = self.state {
             self.state = DoorState::Opening;
-            thread::sleep(Duration::from_secs(1)); // Warte 1 Sekunde
             println!("Opening the door...");
+            thread::sleep(Duration::from_secs(1)); // Warte 1 Sekunde
             self.state = DoorState::Open;
             println!("Door is now open.");
         }
@@ -242,8 +269,8 @@ impl Door {
     fn close(&mut self) {
         if let DoorState::Open = self.state {
             self.state = DoorState::Closing;
-            thread::sleep(Duration::from_secs(1)); // Warte 1 Sekunde
             println!("Closing the door...");
+            thread::sleep(Duration::from_secs(1)); // Warte 1 Sekunde
             self.state = DoorState::Closed;
             println!("Door is now closed.");
         }
