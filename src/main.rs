@@ -23,6 +23,20 @@ enum FloorCommand {
     Request { floor: u8, direction: Direction }
 }
 
+enum ElevatorArrived {
+    Elevator(u8),
+}
+
+enum PassengerToElevator {
+    Enter(u8),
+    PressedButton(u8)
+}
+
+enum ElevatorToPassenger {
+    YouEntered(),
+    YouCanExit()
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Direction {
     Up,
@@ -149,6 +163,9 @@ impl Elevator {
         id: usize,
         rx: Receiver<ElevatorCommand>,
         status_tx: Sender<ElevatorStatus>,
+        elevator_floor_transmitter: Arc<RwLock<Vec<Sender<ElevatorArrived>>>>,
+        elevator_to_passenger_transmitter: Arc<RwLock<Vec<Sender<ElevatorToPassenger>>>>,
+        passenger_to_elevator_receiver: Arc<RwLock<Vec<Receiver<PassengerToElevator>>>>
     ) -> Arc<Mutex<Self>> {
         let elevator = Arc::new(Mutex::new(Self {
             id,
@@ -299,40 +316,150 @@ impl Floor {
     }
 }
 
+struct Passenger {
+    id: usize,
+    current_floor: u8,
+    state: PassengerState,
+    floor_transmitters: Arc<RwLock<HashMap<u8, Sender<FloorCommand>>>>,
+    elevator_floor_receiver: Arc<RwLock<Vec<Receiver<ElevatorArrived>>>>,
+    elevator_passenger_receiver: Receiver<ElevatorToPassenger>,
+    passenger_elevator_transmitter: Arc<RwLock<Vec<Sender<PassengerToElevator>>>>
+}
+
+impl Passenger {
+    fn new(
+        id: usize,
+        current_floor: u8,
+        floor_transmitters: Arc<RwLock<HashMap<u8, Sender<FloorCommand>>>>, // Nachricht an die Ebene zum Drücken des Knopfes
+        elevator_floor_receiver: Arc<RwLock<Vec<Receiver<ElevatorArrived>>>>, // Nachricht vom Elevator an den gesamten Floor
+        elevator_passenger_receiver: Receiver<ElevatorToPassenger>, // Direkte Nachricht vom Elevator an den Passenger
+        passenger_elevator_transmitter: Arc<RwLock<Vec<Sender<PassengerToElevator>>>> // Direkte Nachricht vom Passenger an den Elevator
+    ) {
+        let passenger = Passenger {
+            id,
+            current_floor,
+            state: PassengerState::IdleAtFloor(current_floor),
+            floor_transmitters,
+            elevator_floor_receiver,
+            elevator_passenger_receiver,
+            passenger_elevator_transmitter
+        };
+        // Ownership von passenger in den Thread verschieben
+        thread::spawn(move || {
+            let mut rng = rand::thread_rng();
+            let mut passenger = passenger; // passenger ist jetzt exklusiv im Thread
+            // Zielstockwerk auswählen
+            let mut target_floor;
+            loop {
+                target_floor = rng.gen_range(0..4);
+                if target_floor != passenger.current_floor {
+                    break;
+                }
+            }
+            // Determine new direction
+            let direction = if target_floor > passenger.current_floor {
+                Direction::Up
+            } else {
+                Direction::Down
+            };
+
+            loop {
+                // Anfrage an die aktuelle Etage senden
+                if let Some(sender) = passenger
+                    .floor_transmitters
+                    .read()
+                    .unwrap()
+                    .get(&passenger.current_floor)
+                {
+                    println!(
+                        "Passenger {}: Requesting {:?} from floor {}",
+                        passenger.id, direction, passenger.current_floor
+                    );
+                    sender
+                        .send(FloorCommand::Request {
+                            floor: passenger.current_floor,
+                            direction,
+                        })
+                        .unwrap();
+                }
+                // Warten auf Nachricht vom Fahrstuhl
+                if let Some(receiver) = passenger
+                    .elevator_floor_receiver
+                    .read()
+                    .unwrap()
+                    .get(passenger.current_floor as usize)
+                {
+                    if let Ok(ElevatorArrived::Elevator(elevator_id)) = receiver.recv() {
+                        println!(
+                            "Passenger {}: Elevator {} arrived at floor {}",
+                            passenger.id, elevator_id, passenger.current_floor
+                        );
+                    }
+                } else {
+                    println!(
+                        "Passenger {}: No elevator receiver found for floor {}",
+                        passenger.id, passenger.current_floor
+                    );
+                }
+                // Simuliere das Warten auf den Fahrstuhl
+                thread::sleep(Duration::from_secs(rng.gen_range(2..5)));
+            }
+        });
+    }
+}
+
 
 
 fn main() {
     let floors = 4;
     let elevators = 3;
-    let passengers = 2;
+    let passengers = 1;
 
-    let mut floor_channels: HashMap<u8, Sender<FloorCommand>> = HashMap::new();
+    let mut elevator_floor_receiver: Arc<RwLock<Vec<Receiver<ElevatorArrived>>>> = Arc::new(RwLock::new(Vec::new()));
+    let mut elevator_floor_transmitter: Arc<RwLock<Vec<Sender<ElevatorArrived>>>> = Arc::new(RwLock::new(Vec::new()));
+    let mut elevator_passenger_transmitter: Arc<RwLock<Vec<Sender<ElevatorToPassenger>>>> = Arc::new(RwLock::new(Vec::new()));
+    let mut passenger_elevator_transmitter: Arc<RwLock<Vec<Sender<PassengerToElevator>>>> = Arc::new(RwLock::new(Vec::new()));
+    let mut passenger_elevator_receiver: Arc<RwLock<Vec<Receiver<PassengerToElevator>>>> = Arc::new(RwLock::new(Vec::new()));
+    let floor_transmitter: Arc<RwLock<HashMap<u8, Sender<FloorCommand>>>> = Arc::new(RwLock::new(HashMap::new()));
     let mut elevator_senders = Vec::new();
     let (control_tx, control_rx) = unbounded();
     let (status_tx, status_rx) = unbounded();
+
+    // Etagen initialisieren
+    for i in 0..floors {
+        let (floor_tx, floor_rx) = unbounded();
+        let (elevator_floor_tx, elevator_floor_rx) = unbounded();
+        elevator_floor_transmitter.write().unwrap().push(elevator_floor_tx);
+        elevator_floor_receiver.write().unwrap().push(elevator_floor_rx);
+        floor_transmitter.write().unwrap().insert(i, floor_tx);
+        Floor::new(i, control_tx.clone(), floor_rx);
+    }
+
+    for id in 0..elevators{
+        let (elevator_tx, elevator_rx) = unbounded();
+        passenger_elevator_transmitter.write().unwrap().push(elevator_tx);
+        passenger_elevator_receiver.write().unwrap().push(elevator_rx);
+    }
+
+    // Passagiere initialisieren
+    for i in 0..passengers {
+        let (passenger_tx, passenger_rx) = unbounded();
+        elevator_passenger_transmitter.write().unwrap().push(passenger_tx);
+        Passenger::new(i, 0, Arc::clone(&floor_transmitter), Arc::clone(&elevator_floor_receiver), passenger_rx, Arc::clone(&passenger_elevator_transmitter));
+    }
 
     // Fahrstühle initialisieren
     for id in 0..elevators {
         let (elevator_tx, elevator_rx) = unbounded();
         elevator_senders.push(elevator_tx);
-        Elevator::new(id, elevator_rx, status_tx.clone());
-    }
-
-    // Etagen initialisieren
-    for i in 0..floors {
-        let (floor_tx, floor_rx) = unbounded();
-        floor_channels.insert(i, floor_tx);
-        Floor::new(i, control_tx.clone(), floor_rx);
+        Elevator::new(id, elevator_rx, status_tx.clone(), Arc::clone(&elevator_floor_transmitter), Arc::clone(&elevator_passenger_transmitter), Arc::clone(&passenger_elevator_receiver));
     }
 
     // Control System initialisieren
     let control_system = ControlSystem::new(elevator_senders, control_rx, status_rx);
 
-    // Passagiere initialisieren
-    for i in 0..passengers {
-        
-    }
-    floor_channels.get(&0).unwrap().send(FloorCommand::Request { floor: 0, direction: Direction::Up }).unwrap();
+
+    //floor_channels.read().unwrap().get(&1).unwrap().send(FloorCommand::Request { floor: 1, direction: Direction::Up }).unwrap();
 
     // Beispieleingaben
     // control_tx
