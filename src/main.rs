@@ -303,7 +303,7 @@ impl Elevator {
                                                             "Elevator {}: Capacity reached, ignoring Passenger {}",
                                                             elevator.id, passenger_id
                                                         );
-                                                        continue;
+                                                        break;
                                                     }
 
                                                     println!("Elevator {}: Passenger {} entered", elevator.id, passenger_id);
@@ -611,7 +611,7 @@ impl Passenger {
                         // Warten auf Antwort vom Fahrstuhl
                         let response = select! {
                             recv(passenger.elevator_passenger_receiver) -> msg => msg.ok(),
-                            default(Duration::from_secs(1)) => None, // Timeout nach 1 Sekunde
+                            default(Duration::from_secs(2)) => None, // Timeout nach 1 Sekunde
                         };
 
                         if let Some(ElevatorToPassenger::YouEntered()) = response {
@@ -745,5 +745,6 @@ fn main() {
     //     .unwrap();
 
     // Simulieren von Anfragen
-    thread::sleep(Duration::from_secs(10));
+    // Passenger beachtet nicht dass der Fahrstuhl noch wartet bis die 10 Sekunden um sind
+    thread::sleep(Duration::from_secs(30));
 }
