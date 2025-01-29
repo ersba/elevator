@@ -29,6 +29,7 @@ enum ElevatorArrived {
 enum PassengerToElevator {
     Enter(u8),
     PressedButton(u8),
+    Exit(u8),
 }
 
 enum ElevatorToPassenger {
@@ -109,7 +110,8 @@ impl ControlSystem {
         command_rx: Receiver<ControlCommand>,
         status_rx: Receiver<ElevatorStatus>,
     ) {
-        let mut passenger_targets: Vec<Vec<u8>> = Vec::new();
+        let mut passenger_targets: Vec<Vec<u8>> = vec![Vec::new(); 3];
+        let mut elevator_floors: Vec<u8> = vec![0; 3];
         loop {
             select! {
                 recv(command_rx) -> command => {
@@ -136,18 +138,9 @@ impl ControlSystem {
                                     .unwrap();
                             }
                             ElevatorStatus::DoorOpened(id, floor) => {
-                                println!("Elevator {} opened door at floor {}", id, floor);
+                               
                             }
                             ElevatorStatus::DoorClosed(id, floor) => {
-                                println!("Elevator {} closed door at floor {}", id, floor);
-                            }
-                            ElevatorStatus::TaskCompleted(id) => {
-                                println!("Elevator {} completed a task", id);
-                            }
-                            ElevatorStatus::PassengerCount(id) => {
-                                println!("{} passengers in elevator", id);
-                            }
-                            ElevatorStatus::ElevatorIdle(id, floor) => {
                                 if let Some(&closest_floor) = passenger_targets[id]
                                 .iter()
                                 .min_by_key(|&&target| (target as i32 - floor as i32).abs())
@@ -156,7 +149,7 @@ impl ControlSystem {
                                 passenger_targets[id].retain(|&x| x != closest_floor);
 
                                 println!(
-                                    "Control System: Assigning Elevator {} to move to closest floor {}",
+                                    "Control System: Assigning Elevator {} to moveoto closest floor {}",
                                     id, closest_floor
                                 );
                                 elevators[id]
@@ -166,13 +159,44 @@ impl ControlSystem {
                                 println!("Control System: No pending targets for Elevator {}", id);
                             }
                             }
+                            ElevatorStatus::TaskCompleted(id) => {
+                                println!("Elevator {} completed a task", id);
+                            }
+                            ElevatorStatus::PassengerCount(id) => {
+                                println!("{} passengers in elevator", id);
+                            }
+                            ElevatorStatus::ElevatorIdle(id, floor) => {
+                                println!("Elevator {} is idle at floor {}", id, floor);
+                                elevators[id]
+                                    .send(ElevatorCommand::CloseDoor)
+                                    .unwrap();
+                            }
                             ElevatorStatus::PassengerTarget(elevator_id, targets) => {
                                 // Füge nur neue Ziele hinzu, die nicht bereits vorhanden sind
                                 for target in targets {
+                                    println!("Control System: Received target {} for Elevator {}", target, elevator_id);
                                     if !passenger_targets[elevator_id].contains(&target) {
                                         passenger_targets[elevator_id].push(target);
                                     }
                                 }
+                                if let Some(&closest_floor) = passenger_targets[elevator_id]
+                                .iter()
+                                .min_by_key(|&&target| (target as i32 - elevator_floors[elevator_id] as i32).abs())
+                            {
+                                // Entferne das gefundene Ziel aus der Liste
+                                passenger_targets[elevator_id].retain(|&x| x != closest_floor);
+
+                                println!(
+                                    "Control System: Assigning Elevator {} to moveoto closest floor {}",
+                                    elevator_id, closest_floor
+                                );
+                                elevators[elevator_id]
+                                    .send(ElevatorCommand::MoveTo(closest_floor))
+                                    .unwrap();
+                            } else {
+                                println!("Control System: No pending targets for Elevator {}", elevator_id);
+                            }
+
                             }
                             ElevatorStatus::ElevatorReadyToCloseTheDoor(id) => {
                                 println!("Elevator {} is ready to close the door", id);
@@ -235,12 +259,12 @@ impl Elevator {
 
     fn run(elevator: Arc<Mutex<Self>>, rx: Receiver<ElevatorCommand>) {
         loop {
+            let mut elevator = elevator.lock().unwrap();
             select! {
                 recv(rx) -> command => {
                     if let Ok(command) = command {
                         // Nur während der Verarbeitung sperren
                         {
-                            let mut elevator = elevator.lock().unwrap();
                             match command {
                                 ElevatorCommand::MoveTo(floor) => {
                                     println!("Elevator {}: Received move request to floor {}", elevator.id, floor);
@@ -257,7 +281,7 @@ impl Elevator {
                                         .send(ElevatorStatus::DoorOpened(elevator.id, elevator.current_floor))
                                         .unwrap();
                                     // Kopiere die Liste der Passagiere und ihre Transmitter
-                                    let passengers = elevator.passengers.clone();
+                                    // let passengers = elevator.passengers.clone();
                                     let passenger_transmitters = elevator
                                         .elevator_to_passenger_transmitter
                                         .read()
@@ -265,17 +289,17 @@ impl Elevator {
                                         .clone();
 
                                     // Iteriere über die Passagiere
-                                    for passenger_id in passengers {
-                                        if let Some(transmitter) = passenger_transmitters.get(passenger_id) {
+                                    for passenger_id in &elevator.passengers {
+                                        if let Some(transmitter) = passenger_transmitters.get(*passenger_id) {
                                             transmitter
                                                 .send(ElevatorToPassenger::YouCanExit(elevator.current_floor))
                                                 .expect("Failed to send YouCanExit message");
                                         }
                                     }
                                     
-                                    elevator.status_tx
-                                        .send(ElevatorStatus::ArrivedAtFloor(elevator.id, elevator.current_floor))
-                                        .unwrap();
+                                    // elevator.status_tx
+                                    //     .send(ElevatorStatus::ArrivedAtFloor(elevator.id, elevator.current_floor))
+                                    //     .unwrap();
                                     // Schleife mit Timeout
                                     let start_time = std::time::Instant::now();
                                     let receiver = elevator
@@ -289,12 +313,15 @@ impl Elevator {
                                                 "Elevator {}: Time limit of 10 seconds reached, closing door",
                                                 elevator.id
                                             );
+                                            elevator.status_tx
+                                                .send(ElevatorStatus::ElevatorIdle(elevator.id, elevator.current_floor))
+                                                .unwrap();
                                             break;
                                         }
 
 
                                         // Prüfe auf Passagier-Nachrichten
-                                        if let Ok(message) = receiver.recv()
+                                        if let Ok(message) = receiver.try_recv()
                                         {
                                             match message {
                                                 PassengerToElevator::Enter(passenger_id) => {
@@ -328,6 +355,21 @@ impl Elevator {
                                                         break;
                                                     }
                                                 }
+                                                PassengerToElevator::Exit(passenger_id) => {
+                                                    println!("Elevator {}: Passenger {} exited", elevator.id, passenger_id);
+                                                    elevator.passengers.retain(|&x| x != passenger_id as usize);
+                                                    elevator.passenger_count -= 1;
+                                                    if elevator.passengers.is_empty() {
+                                                        println!("Elevator {}: No more passengers, closing door", elevator.id);
+                                                        break;
+                                                    }
+                                                }
+                                                PassengerToElevator::PressedButton(target_floor) => {
+                                                    println!("Elevator {}: Passenger pressed button for floor {}", elevator.id, target_floor);
+                                                    elevator.status_tx
+                                                        .send(ElevatorStatus::PassengerTarget(elevator.id, vec![target_floor]))
+                                                        .unwrap();
+                                                }
                                                 _ => {
                                                     println!("Elevator {}: Received unexpected message", elevator.id);
                                                 }
@@ -336,15 +378,14 @@ impl Elevator {
                                         }
                                     }
                                 }
-
                                 ElevatorCommand::CloseDoor => {
                                     println!("Elevator {}: Received close door command", elevator.id);
                                     elevator.close_door();
                                     elevator.status_tx
                                         .send(ElevatorStatus::DoorClosed(elevator.id, elevator.current_floor))
                                         .unwrap();
-                                    // Kopiere die Liste der Passagiere und ihre Transmitter
-                                    let passengers = elevator.passengers.clone();
+                                    // // Kopiere die Liste der Passagiere und ihre Transmitter
+                                    // let passengers = elevator.passengers.clone();
                                     let passenger_transmitters = elevator
                                         .elevator_to_passenger_transmitter
                                         .read()
@@ -352,8 +393,8 @@ impl Elevator {
                                         .clone();
 
                                     // Iteriere über die Passagiere
-                                    for passenger_id in passengers {
-                                        if let Some(transmitter) = passenger_transmitters.get(passenger_id) {
+                                    for passenger_id in &elevator.passengers {
+                                        if let Some(transmitter) = passenger_transmitters.get(*passenger_id) {
                                             println!(
                                                 "Elevator {}: Informing Passenger {} to choose their floor",
                                                 elevator.id, passenger_id
@@ -381,6 +422,9 @@ impl Elevator {
                                                 PassengerToElevator::PressedButton(target_floor) => {
                                                     println!("Elevator {}: Passenger pressed button for floor {}", elevator.id, target_floor);
                                                     pressed_buttons.push(target_floor);
+                                                    elevator.status_tx
+                                                        .send(ElevatorStatus::PassengerTarget(elevator.id, pressed_buttons.clone()))
+                                                        .unwrap();
                                                 }
                                                 _ => {}
                                             }
@@ -388,14 +432,13 @@ impl Elevator {
                                     }
 
                                 }
-                            }
+                            
                         } // `Mutex` wird hier automatisch freigegeben
                     }
                 }
-                default(Duration::from_millis(10000)) => {
-                    println!("Waiting for a new command...");
                 }
             }
+            
         }
     }
 
@@ -551,16 +594,52 @@ impl Passenger {
 
             loop {
                 if !matches!(passenger.state, PassengerState::IdleAtFloor(floor) if floor == passenger.current_floor) {
+                    // Nachricht an den Fahrstuhl senden
+                    let elevator_transmitter = passenger
+                    .passenger_elevator_transmitter
+                    .read()
+                    .unwrap()
+                    .get(passenger.current_elevator as usize)
+                    .cloned() // Klone den Sender, damit er außerhalb nutzbar bleibt
+                    .expect("Failed to get PassengerToElevator transmitter");
+                    
                     let elevator_receiver = passenger
                             .elevator_passenger_receiver
                             .clone();
+                        if let Ok(message) = elevator_receiver.recv() {
+                            match message {
+                                ElevatorToPassenger::YouCanExit(floor) => {
+                                    println!(
+                                        "Passenger {}: arrived at floor {}",
+                                        passenger.id, floor
+                                    );
+                                    if floor == passenger.target_floor {
+                                        elevator_transmitter
+                                            .send(PassengerToElevator::Exit(passenger.id as u8))
+                                            .expect("Failed to send PassengerToElevator::Exit message");
+                                        passenger.state = PassengerState::ExitingElevator;
+                                        passenger.current_floor = floor;
+                                        passenger.state = PassengerState::IdleAtFloor(passenger.current_floor);
+                                        break;
+                                    }
+                                }
+                                ElevatorToPassenger::YouCanChooseFloor => {
+                                    println!("Passenger chooses floor {}", target_floor);
+                                    elevator_transmitter
+                                        .send(PassengerToElevator::PressedButton(target_floor))
+                                        .expect("Failed to send button press message");
+                                }
+                                _ => {}
+                            }
+                        }
                     if let Ok(ElevatorToPassenger::YouCanExit(floor)) = elevator_receiver.recv() {
                         println!(
                             "Passenger {}: arrived at floor {}",
                             passenger.id, floor
                         );
+                        break;
                     }
-                    break;
+                    continue;
                 }
                 else {
                 // Anfrage an die aktuelle Etage senden
@@ -611,7 +690,7 @@ impl Passenger {
                         // Warten auf Antwort vom Fahrstuhl
                         let response = select! {
                             recv(passenger.elevator_passenger_receiver) -> msg => msg.ok(),
-                            default(Duration::from_secs(2)) => None, // Timeout nach 1 Sekunde
+                            default(Duration::from_secs(2)) => None, // Timeout nach 2 Sekunde
                         };
 
                         if let Some(ElevatorToPassenger::YouEntered()) = response {
@@ -620,11 +699,8 @@ impl Passenger {
                                 passenger.id, elevator_id
                             );
                             passenger.state = PassengerState::InElevator(elevator_id);
-                            thread::sleep(Duration::from_secs(1)); // Warte 1 Sekunde
-                            elevator_transmitter
-                            .send(PassengerToElevator::PressedButton(passenger.target_floor))
-                            .expect("Failed to send button press message");
-                            break; // Beende die Schleife, wenn der Passagier eingestiegen ist
+                            // thread::sleep(Duration::from_secs(1)); // Warte 1 Sekunde
+                            continue; // Beende die Schleife, wenn der Passagier eingestiegen ist
                         } else {
                             println!(
                                 "Passenger {}: No response from Elevator {} within 1 second",
@@ -705,7 +781,12 @@ fn main() {
 
         // Zufällige Startetage zwischen 0 und floors - 1 auswählen
         let random_start_floor = rand::thread_rng().gen_range(0..floors) as u8;
-        let random_target_floor = rand::thread_rng().gen_range(0..floors) as u8;
+        let random_target_floor = loop {
+            let floor = rand::thread_rng().gen_range(0..floors) as u8;
+            if floor != random_start_floor {
+                break floor;
+            }
+        };
         Passenger::new(
             i,
             random_start_floor,
